@@ -1,4 +1,4 @@
-# WhiteJack 🃏 - Juego de Blackjack Multijugador
+# Blackjack Multijugador
 
 Juego de Blackjack en consola con **modo Singleplayer** y **Multiplayer** con descubrimiento automático de jugadores en red local.
 
@@ -152,3 +152,4 @@ Este proyecto es de código abierto y está disponible para uso educativo.
 ---
 
 **¡Disfruta el juego! 🎰**
+
