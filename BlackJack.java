@@ -1,6 +1,6 @@
-import java.util.*;
 import java.io.*;
 import java.net.*;
+import java.util.*;
 
 /**
  * Blackjack Multijugador
@@ -23,7 +23,7 @@ public class BlackJack {
     private static final int PUERTO_BROADCAST = 5556;
     private static final String MENSAJE_BROADCAST = "BLACKJACK_GAME";
     private static final int TIMEOUT_SERVIDOR = 60000; // 1 minuto
-    private static final int TIMEOUT_BUSQUEDA = 2000;  // 2 segundos
+    private static final int TIMEOUT_BUSQUEDA = 6000;  // 6 segundos (más tiempo para subredes diferentes)
     
     // Reglas del juego
     private static final int DEALER_STAND_VALUE = 17;
@@ -222,13 +222,47 @@ public class BlackJack {
         
         // Obtener la IP real de la red local (WiFi), no VPN
         private String obtenerIPLocal() throws Exception {
+            System.out.println("[INFO] Detectando interfaces de red...");
             Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            
+            String mejorIP = null;
+            String ipAlternativa = null;
             
             while (interfaces.hasMoreElements()) {
                 NetworkInterface ni = interfaces.nextElement();
                 
+                String nombreInterface = ni.getDisplayName().toLowerCase();
+                System.out.println("   Interface: " + ni.getDisplayName() + " (" + ni.getName() + ")");
+                System.out.println("     - Activa: " + ni.isUp());
+                System.out.println("     - Loopback: " + ni.isLoopback());
+                System.out.println("     - Virtual: " + ni.isVirtual());
+                
                 // Saltar interfaces inactivas o loopback
-                if (!ni.isUp() || ni.isLoopback()) continue;
+                if (!ni.isUp() || ni.isLoopback()) {
+                    System.out.println("     [SKIP] Saltada (inactiva o loopback)");
+                    continue;
+                }
+                
+                // Priorizar interfaces WiFi/Wireless
+                boolean esWiFi = nombreInterface.contains("wi-fi") || 
+                               nombreInterface.contains("wireless") ||
+                               nombreInterface.contains("wlan") ||
+                               nombreInterface.contains("802.11");
+                
+                // Evitar interfaces virtuales (VPN, Docker, etc.)
+                boolean esVirtual = nombreInterface.contains("vmware") ||
+                                  nombreInterface.contains("virtualbox") ||
+                                  nombreInterface.contains("hyper-v") ||
+                                  nombreInterface.contains("docker") ||
+                                  nombreInterface.contains("vpn") ||
+                                  nombreInterface.contains("tap") ||
+                                  nombreInterface.contains("tun") ||
+                                  ni.isVirtual();
+                
+                if (esVirtual) {
+                    System.out.println("     [SKIP] Saltada (interface virtual)");
+                    continue;
+                }
                 
                 Enumeration<InetAddress> addresses = ni.getInetAddresses();
                 while (addresses.hasMoreElements()) {
@@ -237,92 +271,216 @@ public class BlackJack {
                     if (!(addr instanceof java.net.Inet4Address)) continue;
                     String ip = addr.getHostAddress();
                     
+                    System.out.println("     [IP] IP encontrada: " + ip);
+                    
                     // Buscar IP de red local (192.168.x.x o 10.x.x.x)
+                    boolean esIPPrivada = false;
                     if (ip.startsWith("192.168.") || ip.startsWith("10.")) {
-                        return ip;
-                    }
-                    // También aceptar 172.16-31.x.x (rango privado)
-                    if (ip.startsWith("172.")) {
+                        esIPPrivada = true;
+                    } else if (ip.startsWith("172.")) {
+                        // También aceptar 172.16-31.x.x (rango privado)
                         String[] parts = ip.split("\\.");
                         if (parts.length >= 2) {
-                            int second = Integer.parseInt(parts[1]);
-                            if (second >= 16 && second <= 31) {
-                                return ip;
+                            try {
+                                int second = Integer.parseInt(parts[1]);
+                                if (second >= 16 && second <= 31) {
+                                    esIPPrivada = true;
+                                }
+                            } catch (NumberFormatException e) {
+                                // Ignorar si no se puede parsear
                             }
+                        }
+                    }
+                    
+                    if (esIPPrivada) {
+                        if (esWiFi && mejorIP == null) {
+                            mejorIP = ip;
+                            System.out.println("     [WIFI] IP WiFi seleccionada: " + ip);
+                        } else if (ipAlternativa == null) {
+                            ipAlternativa = ip;
+                            System.out.println("     [ALT] IP alternativa: " + ip);
                         }
                     }
                 }
             }
             
+            // Priorizar IP de WiFi, luego cualquier IP privada
+            String ipFinal = mejorIP != null ? mejorIP : ipAlternativa;
+            
+            if (ipFinal != null) {
+                System.out.println("[SELECTED] IP local detectada: " + ipFinal);
+                return ipFinal;
+            }
+            
             // Si no encuentra IP local, usar la por defecto
-            return InetAddress.getLocalHost().getHostAddress();
+            String ipDefault = InetAddress.getLocalHost().getHostAddress();
+            System.out.println("[DEFAULT] Usando IP por defecto: " + ipDefault);
+            return ipDefault;
         }
         
         @Override
         public void run() {
-            try (DatagramSocket socket = new DatagramSocket(PUERTO_BROADCAST)) {
+            DatagramSocket socket = null;
+            try {
+                System.out.println("[DISCOVERY] Iniciando servidor de descubrimiento en puerto " + PUERTO_BROADCAST);
+                System.out.println("[DISCOVERY] Mi IP: " + miIP);
+                
+                socket = new DatagramSocket(PUERTO_BROADCAST);
                 socket.setBroadcast(true);
+                socket.setSoTimeout(1000); // Timeout corto para poder verificar 'running'
+                
                 while (running) {
-                    byte[] buffer = new byte[256];
-                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                    socket.receive(packet);
-                    String mensaje = new String(packet.getData(), 0, packet.getLength());
-                    if (mensaje.startsWith(MENSAJE_BROADCAST)) {
-                        // Responder con nuestra IP
-                        String respuesta = MENSAJE_BROADCAST + ":" + miIP;
-                        byte[] respuestaBytes = respuesta.getBytes();
-                        DatagramPacket respuestaPacket = new DatagramPacket(
-                            respuestaBytes, respuestaBytes.length, 
-                            packet.getAddress(), packet.getPort()
-                        );
-                        socket.send(respuestaPacket);
+                    try {
+                        byte[] buffer = new byte[256];
+                        DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                        socket.receive(packet);
+                        String mensaje = new String(packet.getData(), 0, packet.getLength());
+                        String direccionRemota = packet.getAddress().getHostAddress();
+                        
+                        System.out.println("[RECEIVED] Solicitud recibida de " + direccionRemota + ": " + mensaje);
+                        
+                        if (mensaje.startsWith(MENSAJE_BROADCAST)) {
+                            // No responder a nosotros mismos
+                            if (!direccionRemota.equals(miIP)) {
+                                // Responder con nuestra IP
+                                String respuesta = MENSAJE_BROADCAST + ":" + miIP;
+                                byte[] respuestaBytes = respuesta.getBytes();
+                                DatagramPacket respuestaPacket = new DatagramPacket(
+                                    respuestaBytes, respuestaBytes.length, 
+                                    packet.getAddress(), packet.getPort()
+                                );
+                                socket.send(respuestaPacket);
+                                System.out.println("[SENT] Respuesta enviada a " + direccionRemota + ": " + respuesta);
+                            } else {
+                                System.out.println("[SELF] Ignorando solicitud propia");
+                            }
+                        }
+                    } catch (SocketTimeoutException e) {
+                        // Timeout normal, continuar
+                        continue;
                     }
                 }
             } catch (Exception e) {
-                // Silencioso
+                if (running) { // Solo mostrar error si no estamos cerrando intencionalmente
+                    System.out.println("[ERROR] Error en servidor de descubrimiento: " + e.getMessage());
+                }
+            } finally {
+                if (socket != null) {
+                    socket.close();
+                }
+                System.out.println("[STOP] Servidor de descubrimiento detenido");
             }
         }
         
         public void detener() {
             running = false;
+            interrupt();
         }
     }
     
     static Set<String> buscarJugadores() {
         Set<String> jugadores = new HashSet<>();
+        DatagramSocket socket = null;
         try {
-            DatagramSocket socket = new DatagramSocket();
+            System.out.println("[SEARCH] Iniciando busqueda de jugadores...");
+            socket = new DatagramSocket();
             socket.setBroadcast(true);
             socket.setSoTimeout(TIMEOUT_BUSQUEDA);
             
+            // Obtener nuestra IP para calcular broadcasts dirigidos
+            String miIP = null;
+            try {
+                NetworkDiscovery discovery = new NetworkDiscovery();
+                miIP = discovery.miIP;
+                System.out.println("[LOCAL] Mi IP detectada: " + miIP);
+            } catch (Exception e) {
+                System.out.println("[ERROR] No se pudo detectar IP local: " + e.getMessage());
+            }
+            
+            // Lista de direcciones broadcast estándar
+            String[] direccionesBroadcast = {
+                "255.255.255.255",  // Broadcast global
+                "192.168.1.255",    // Subredes WiFi comunes
+                "192.168.0.255",
+                "10.0.0.255",       // Redes corporativas
+                "172.16.255.255",   // Rango 172.16-31.x.x
+                "172.31.255.255"
+            };
+            
             byte[] buffer = MENSAJE_BROADCAST.getBytes();
-            DatagramPacket packet = new DatagramPacket(
-                buffer, buffer.length,
-                InetAddress.getByName("255.255.255.255"), PUERTO_BROADCAST
-            );
             
-            socket.send(packet);
+            // Enviar a direcciones broadcast estándar
+            for (String broadcast : direccionesBroadcast) {
+                try {
+                    System.out.println("[BROADCAST] Enviando a: " + broadcast);
+                    DatagramPacket packet = new DatagramPacket(
+                        buffer, buffer.length,
+                        InetAddress.getByName(broadcast), PUERTO_BROADCAST
+                    );
+                    socket.send(packet);
+                } catch (Exception e) {
+                    System.out.println("   [ERROR] Error enviando a " + broadcast + ": " + e.getMessage());
+                }
+            }
             
+            // Calcular y enviar broadcast dirigido a nuestra subred
+            if (miIP != null && !miIP.equals("desconocida")) {
+                try {
+                    String[] partes = miIP.split("\\.");
+                    if (partes.length == 4) {
+                        String broadcastLocal = partes[0] + "." + partes[1] + "." + partes[2] + ".255";
+                        System.out.println("[BROADCAST] Enviando broadcast local a: " + broadcastLocal);
+                        DatagramPacket packet = new DatagramPacket(
+                            buffer, buffer.length,
+                            InetAddress.getByName(broadcastLocal), PUERTO_BROADCAST
+                        );
+                        socket.send(packet);
+                    }
+                } catch (Exception e) {
+                    System.out.println("   [ERROR] Error con broadcast local: " + e.getMessage());
+                }
+            }
+            
+            System.out.println("[LISTEN] Escuchando respuestas...");
             long inicio = System.currentTimeMillis();
+            int respuestasRecibidas = 0;
+            
             while (System.currentTimeMillis() - inicio < TIMEOUT_BUSQUEDA) {
                 try {
                     byte[] respuestaBuffer = new byte[256];
                     DatagramPacket respuesta = new DatagramPacket(respuestaBuffer, respuestaBuffer.length);
                     socket.receive(respuesta);
                     String mensaje = new String(respuesta.getData(), 0, respuesta.getLength());
+                    respuestasRecibidas++;
+                    
+                    System.out.println("[RESPONSE] Respuesta #" + respuestasRecibidas + " de " + 
+                                     respuesta.getAddress().getHostAddress() + ": " + mensaje);
+                    
                     if (mensaje.startsWith(MENSAJE_BROADCAST)) {
                         String[] partes = mensaje.split(":");
                         if (partes.length > 1) {
-                            jugadores.add(partes[1]);
+                            String ipJugador = partes[1];
+                            jugadores.add(ipJugador);
+                            System.out.println("[FOUND] Jugador encontrado: " + ipJugador);
                         }
                     }
                 } catch (SocketTimeoutException e) {
                     break;
                 }
             }
-            socket.close();
+            
+            System.out.println("[COMPLETE] Busqueda completada. Jugadores encontrados: " + jugadores.size());
+            for (String jugador : jugadores) {
+                System.out.println("   - " + jugador);
+            }
+            
         } catch (Exception e) {
-            System.out.println("Error buscando jugadores: " + e.getMessage());
+            System.out.println("[ERROR] Error buscando jugadores: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
         }
         return jugadores;
     }
@@ -334,13 +492,69 @@ public class BlackJack {
         System.out.println("\n=== Modo Multiplayer ===");
         System.out.println("1. Crear partida (esperar jugador)");
         System.out.println("2. Buscar partidas");
-        System.out.print("Opción: ");
+        System.out.println("3. Diagnostico de red");
+        System.out.print("Opcion: ");
         String opcion = in.nextLine().trim();
         
         if (opcion.equals("1")) {
             crearPartida();
         } else if (opcion.equals("2")) {
             buscarYConectar(in);
+        } else if (opcion.equals("3")) {
+            diagnosticoRed();
+        }
+    }
+    
+    static void diagnosticoRed() {
+        System.out.println("\n=== DIAGNOSTICO DE RED ===");
+        try {
+            NetworkDiscovery discovery = new NetworkDiscovery();
+            System.out.println("[INFO] IP local detectada: " + discovery.miIP);
+            
+            // Probar puertos
+            System.out.println("\n[TEST] Probando puertos...");
+            if (probarPuerto(PUERTO_BROADCAST)) {
+                System.out.println("[OK] Puerto " + PUERTO_BROADCAST + " (broadcast) disponible");
+            } else {
+                System.out.println("[ERROR] Puerto " + PUERTO_BROADCAST + " ocupado o bloqueado");
+            }
+            
+            if (probarPuerto(PUERTO_JUEGO)) {
+                System.out.println("[OK] Puerto " + PUERTO_JUEGO + " (juego) disponible");
+            } else {
+                System.out.println("[ERROR] Puerto " + PUERTO_JUEGO + " ocupado o bloqueado");
+            }
+            
+            // Probar broadcast local
+            System.out.println("\n[TEST] Probando broadcast local...");
+            String[] partes = discovery.miIP.split("\\.");
+            if (partes.length == 4) {
+                String broadcastLocal = partes[0] + "." + partes[1] + "." + partes[2] + ".255";
+                System.out.println("[INFO] Direccion broadcast calculada: " + broadcastLocal);
+                
+                try {
+                    InetAddress.getByName(broadcastLocal);
+                    System.out.println("[OK] Direccion broadcast es valida");
+                } catch (Exception e) {
+                    System.out.println("[ERROR] Direccion broadcast invalida: " + e.getMessage());
+                }
+            }
+            
+        } catch (Exception e) {
+            System.out.println("[ERROR] Error en diagnostico: " + e.getMessage());
+        }
+        
+        System.out.println("\n[INFO] Presiona Enter para continuar...");
+        new Scanner(System.in).nextLine();
+    }
+    
+    static boolean probarPuerto(int puerto) {
+        try {
+            DatagramSocket socket = new DatagramSocket(puerto);
+            socket.close();
+            return true;
+        } catch (Exception e) {
+            return false;
         }
     }
     
@@ -371,55 +585,102 @@ public class BlackJack {
     
     static void buscarYConectar(Scanner in) {
         while (true) {
-            System.out.println("\nBuscando partidas...");
-            Set<String> jugadores = buscarJugadores();
+            System.out.println("\n=== BUSCAR PARTIDAS ===");
+            System.out.println("1. Busqueda automatica");
+            System.out.println("2. Conexion manual por IP");
+            System.out.println("3. Volver al menu");
+            System.out.print("Selecciona una opcion: ");
+            String opcion = in.nextLine().trim();
             
-            if (jugadores.isEmpty()) {
-                System.out.println("No se encontraron partidas.");
-            } else {
-                System.out.println("\nPartidas disponibles:");
-                List<String> listaJugadores = new ArrayList<>(jugadores);
-                for (int i = 0; i < listaJugadores.size(); i++) {
-                    System.out.println((i + 1) + ". " + listaJugadores.get(i));
-                }
-                System.out.println("\n0. Refrescar");
-                System.out.println("q. Volver al menú");
-                System.out.print("Selecciona una opción: ");
-                String seleccion = in.nextLine().trim();
+            if (opcion.equals("1")) {
+                // Búsqueda automática
+                System.out.println("\nBuscando partidas automaticamente...");
+                Set<String> jugadores = buscarJugadores();
                 
-                if (seleccion.equals("q")) {
-                    return;
-                } else if (seleccion.equals("0")) {
-                    continue;
+                if (jugadores.isEmpty()) {
+                    System.out.println("No se encontraron partidas automaticamente.");
+                    System.out.print("Presiona Enter para volver al menu de busqueda...");
+                    in.nextLine();
                 } else {
-                    try {
-                        int index = Integer.parseInt(seleccion) - 1;
-                        if (index >= 0 && index < listaJugadores.size()) {
-                            String ip = listaJugadores.get(index);
-                            conectarAPartida(ip);
-                            return;
+                    System.out.println("\nPartidas encontradas:");
+                    List<String> listaJugadores = new ArrayList<>(jugadores);
+                    for (int i = 0; i < listaJugadores.size(); i++) {
+                        System.out.println((i + 1) + ". " + listaJugadores.get(i));
+                    }
+                    System.out.println("\n0. Volver al menu de busqueda");
+                    System.out.print("Selecciona una partida: ");
+                    String seleccion = in.nextLine().trim();
+                    
+                    if (seleccion.equals("0")) {
+                        continue;
+                    } else {
+                        try {
+                            int index = Integer.parseInt(seleccion) - 1;
+                            if (index >= 0 && index < listaJugadores.size()) {
+                                String ip = listaJugadores.get(index);
+                                conectarAPartida(ip);
+                                return;
+                            } else {
+                                System.out.println("Opcion no valida.");
+                            }
+                        } catch (NumberFormatException e) {
+                            System.out.println("Opcion no valida.");
                         }
-                    } catch (NumberFormatException e) {
-                        System.out.println("Opción no válida.");
                     }
                 }
+            } else if (opcion.equals("2")) {
+                // Conexión manual
+                System.out.print("Introduce la IP del otro jugador: ");
+                String ipManual = in.nextLine().trim();
+                if (!ipManual.isEmpty()) {
+                    conectarAPartida(ipManual);
+                    return;
+                } else {
+                    System.out.println("IP no valida.");
+                }
+            } else if (opcion.equals("3")) {
+                // Salir
+                return;
+            } else {
+                System.out.println("Opcion no valida.");
             }
-            
-            System.out.print("\nPresiona Enter para refrescar (o 'q' para salir): ");
-            String cmd = in.nextLine().trim();
-            if (cmd.equals("q")) return;
         }
     }
     
     static void conectarAPartida(String ip) {
         try {
-            System.out.println("Conectando a " + ip + "...");
+            System.out.println("[CONNECT] Probando conectividad a " + ip + "...");
+            
+            // Primero probar si el puerto está abierto
+            if (!probarConectividad(ip, PUERTO_JUEGO)) {
+                System.out.println("[ERROR] No se puede conectar a " + ip + ":" + PUERTO_JUEGO);
+                System.out.println("         Asegurate de que:");
+                System.out.println("         1. El otro jugador haya creado una partida");
+                System.out.println("         2. El firewall permita conexiones en el puerto " + PUERTO_JUEGO);
+                System.out.println("         3. Ambos esten en la misma red o tengan conectividad directa");
+                return;
+            }
+            
+            System.out.println("[CONNECT] Conectando a " + ip + "...");
             Socket socket = new Socket(ip, PUERTO_JUEGO);
-            System.out.println("¡Conectado!");
+            System.out.println("[SUCCESS] Conectado exitosamente!");
             
             jugarMultiplayer(null, socket, false);
         } catch (Exception e) {
-            System.out.println("Error al conectar: " + e.getMessage());
+            System.out.println("[ERROR] Error al conectar: " + e.getMessage());
+            System.out.println("        Detalles tecnicos: " + e.getClass().getSimpleName());
+        }
+    }
+    
+    static boolean probarConectividad(String ip, int puerto) {
+        try {
+            Socket testSocket = new Socket();
+            testSocket.connect(new InetSocketAddress(ip, puerto), 3000); // 3 segundos timeout
+            testSocket.close();
+            return true;
+        } catch (Exception e) {
+            System.out.println("[DEBUG] Test de conectividad fallo: " + e.getMessage());
+            return false;
         }
     }
     
