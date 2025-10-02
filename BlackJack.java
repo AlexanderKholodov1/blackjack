@@ -1,6 +1,6 @@
-import java.util.*;
 import java.io.*;
 import java.net.*;
+import java.util.*;
 
 /**
  * Blackjack Multijugador
@@ -23,7 +23,7 @@ public class BlackJack {
     private static final int PUERTO_BROADCAST = 5556;
     private static final String MENSAJE_BROADCAST = "BLACKJACK_GAME";
     private static final int TIMEOUT_SERVIDOR = 60000; // 1 minuto
-    private static final int TIMEOUT_BUSQUEDA = 2000;  // 2 segundos
+    private static final int TIMEOUT_BUSQUEDA = 6000;  // 6 segundos (más tiempo para subredes diferentes)
     
     // Reglas del juego
     private static final int DEALER_STAND_VALUE = 17;
@@ -222,13 +222,47 @@ public class BlackJack {
         
         // Obtener la IP real de la red local (WiFi), no VPN
         private String obtenerIPLocal() throws Exception {
+            System.out.println("[INFO] Detectando interfaces de red...");
             Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            
+            String mejorIP = null;
+            String ipAlternativa = null;
             
             while (interfaces.hasMoreElements()) {
                 NetworkInterface ni = interfaces.nextElement();
                 
+                String nombreInterface = ni.getDisplayName().toLowerCase();
+                System.out.println("   Interface: " + ni.getDisplayName() + " (" + ni.getName() + ")");
+                System.out.println("     - Activa: " + ni.isUp());
+                System.out.println("     - Loopback: " + ni.isLoopback());
+                System.out.println("     - Virtual: " + ni.isVirtual());
+                
                 // Saltar interfaces inactivas o loopback
-                if (!ni.isUp() || ni.isLoopback()) continue;
+                if (!ni.isUp() || ni.isLoopback()) {
+                    System.out.println("     [SKIP] Saltada (inactiva o loopback)");
+                    continue;
+                }
+                
+                // Priorizar interfaces WiFi/Wireless
+                boolean esWiFi = nombreInterface.contains("wi-fi") || 
+                               nombreInterface.contains("wireless") ||
+                               nombreInterface.contains("wlan") ||
+                               nombreInterface.contains("802.11");
+                
+                // Evitar interfaces virtuales (VPN, Docker, etc.)
+                boolean esVirtual = nombreInterface.contains("vmware") ||
+                                  nombreInterface.contains("virtualbox") ||
+                                  nombreInterface.contains("hyper-v") ||
+                                  nombreInterface.contains("docker") ||
+                                  nombreInterface.contains("vpn") ||
+                                  nombreInterface.contains("tap") ||
+                                  nombreInterface.contains("tun") ||
+                                  ni.isVirtual();
+                
+                if (esVirtual) {
+                    System.out.println("     [SKIP] Saltada (interface virtual)");
+                    continue;
+                }
                 
                 Enumeration<InetAddress> addresses = ni.getInetAddresses();
                 while (addresses.hasMoreElements()) {
@@ -237,92 +271,233 @@ public class BlackJack {
                     if (!(addr instanceof java.net.Inet4Address)) continue;
                     String ip = addr.getHostAddress();
                     
+                    System.out.println("     [IP] IP encontrada: " + ip);
+                    
                     // Buscar IP de red local (192.168.x.x o 10.x.x.x)
+                    boolean esIPPrivada = false;
                     if (ip.startsWith("192.168.") || ip.startsWith("10.")) {
-                        return ip;
-                    }
-                    // También aceptar 172.16-31.x.x (rango privado)
-                    if (ip.startsWith("172.")) {
+                        esIPPrivada = true;
+                    } else if (ip.startsWith("172.")) {
+                        // También aceptar 172.16-31.x.x (rango privado)
                         String[] parts = ip.split("\\.");
                         if (parts.length >= 2) {
-                            int second = Integer.parseInt(parts[1]);
-                            if (second >= 16 && second <= 31) {
-                                return ip;
+                            try {
+                                int second = Integer.parseInt(parts[1]);
+                                if (second >= 16 && second <= 31) {
+                                    esIPPrivada = true;
+                                }
+                            } catch (NumberFormatException e) {
+                                // Ignorar si no se puede parsear
                             }
+                        }
+                    }
+                    
+                    if (esIPPrivada) {
+                        if (esWiFi && mejorIP == null) {
+                            mejorIP = ip;
+                            System.out.println("     [WIFI] IP WiFi seleccionada: " + ip);
+                        } else if (ipAlternativa == null) {
+                            ipAlternativa = ip;
+                            System.out.println("     [ALT] IP alternativa: " + ip);
                         }
                     }
                 }
             }
             
+            // Priorizar IP de WiFi, luego cualquier IP privada
+            String ipFinal = mejorIP != null ? mejorIP : ipAlternativa;
+            
+            if (ipFinal != null) {
+                System.out.println("[SELECTED] IP local detectada: " + ipFinal);
+                return ipFinal;
+            }
+            
             // Si no encuentra IP local, usar la por defecto
-            return InetAddress.getLocalHost().getHostAddress();
+            String ipDefault = InetAddress.getLocalHost().getHostAddress();
+            System.out.println("[DEFAULT] Usando IP por defecto: " + ipDefault);
+            return ipDefault;
         }
         
         @Override
         public void run() {
-            try (DatagramSocket socket = new DatagramSocket(PUERTO_BROADCAST)) {
+            DatagramSocket socket = null;
+            try {
+                System.out.println("[DISCOVERY] Iniciando servidor de descubrimiento en puerto " + PUERTO_BROADCAST);
+                System.out.println("[DISCOVERY] Mi IP: " + miIP);
+                
+                socket = new DatagramSocket(PUERTO_BROADCAST);
                 socket.setBroadcast(true);
+                socket.setSoTimeout(1000); // Timeout corto para poder verificar 'running'
+                
                 while (running) {
-                    byte[] buffer = new byte[256];
-                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                    socket.receive(packet);
-                    String mensaje = new String(packet.getData(), 0, packet.getLength());
-                    if (mensaje.startsWith(MENSAJE_BROADCAST)) {
-                        // Responder con nuestra IP
-                        String respuesta = MENSAJE_BROADCAST + ":" + miIP;
-                        byte[] respuestaBytes = respuesta.getBytes();
-                        DatagramPacket respuestaPacket = new DatagramPacket(
-                            respuestaBytes, respuestaBytes.length, 
-                            packet.getAddress(), packet.getPort()
-                        );
-                        socket.send(respuestaPacket);
+                    try {
+                        byte[] buffer = new byte[256];
+                        DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                        socket.receive(packet);
+                        String mensaje = new String(packet.getData(), 0, packet.getLength());
+                        String direccionRemota = packet.getAddress().getHostAddress();
+                        
+                        System.out.println("[RECEIVED] Solicitud recibida de " + direccionRemota + ": " + mensaje);
+                        
+                        if (mensaje.startsWith(MENSAJE_BROADCAST)) {
+                            // No responder a nosotros mismos
+                            if (!direccionRemota.equals(miIP)) {
+                                // Responder con nuestra IP
+                                String respuesta = MENSAJE_BROADCAST + ":" + miIP;
+                                byte[] respuestaBytes = respuesta.getBytes();
+                                DatagramPacket respuestaPacket = new DatagramPacket(
+                                    respuestaBytes, respuestaBytes.length, 
+                                    packet.getAddress(), packet.getPort()
+                                );
+                                socket.send(respuestaPacket);
+                                System.out.println("[SENT] Respuesta enviada a " + direccionRemota + ": " + respuesta);
+                            } else {
+                                System.out.println("[SELF] Ignorando solicitud propia");
+                            }
+                        }
+                    } catch (SocketTimeoutException e) {
+                        // Timeout normal, continuar
+                        continue;
                     }
                 }
             } catch (Exception e) {
-                // Silencioso
+                if (running) { // Solo mostrar error si no estamos cerrando intencionalmente
+                    System.out.println("[ERROR] Error en servidor de descubrimiento: " + e.getMessage());
+                }
+            } finally {
+                if (socket != null) {
+                    socket.close();
+                }
+                // Solo mostrar mensaje si se detuvo intencionalmente por el usuario
+                if (running) {
+                    System.out.println("[STOP] Servidor de descubrimiento detenido");
+                }
             }
         }
         
         public void detener() {
             running = false;
+            interrupt();
         }
     }
     
     static Set<String> buscarJugadores() {
         Set<String> jugadores = new HashSet<>();
+        DatagramSocket socket = null;
         try {
-            DatagramSocket socket = new DatagramSocket();
+            System.out.println("[SEARCH] Iniciando busqueda de jugadores...");
+            socket = new DatagramSocket();
             socket.setBroadcast(true);
             socket.setSoTimeout(TIMEOUT_BUSQUEDA);
             
+            // Obtener nuestra IP para calcular broadcasts dirigidos
+            String miIP = null;
+            try {
+                NetworkDiscovery discovery = new NetworkDiscovery();
+                miIP = discovery.miIP;
+                System.out.println("[LOCAL] Mi IP detectada: " + miIP);
+            } catch (Exception e) {
+                System.out.println("[ERROR] No se pudo detectar IP local: " + e.getMessage());
+            }
+            
+            // Generar direcciones broadcast dinámicamente basadas en la IP local
+            Set<String> direccionesBroadcast = new HashSet<>();
+            
+            // Broadcast global
+            direccionesBroadcast.add("255.255.255.255");
+            
+            // Si tenemos una IP local, generar broadcasts para rangos comunes de esa clase
+            if (miIP != null && !miIP.equals("desconocida")) {
+                String[] partes = miIP.split("\\.");
+                if (partes.length == 4) {
+                    String baseIP = partes[0] + "." + partes[1];
+                    
+                    // Agregar broadcast de nuestra subred específica
+                    String broadcastLocal = baseIP + "." + partes[2] + ".255";
+                    direccionesBroadcast.add(broadcastLocal);
+                    System.out.println("[LOCAL] Detectada subred local: " + broadcastLocal);
+                    
+                    // Agregar broadcasts de subredes cercanas (útil para configuraciones complejas)
+                    try {
+                        int terceraParteActual = Integer.parseInt(partes[2]);
+                        for (int i = Math.max(0, terceraParteActual - 10); i <= Math.min(255, terceraParteActual + 10); i++) {
+                            if (i != terceraParteActual) { // No duplicar la nuestra
+                                direccionesBroadcast.add(baseIP + "." + i + ".255");
+                            }
+                        }
+                    } catch (NumberFormatException e) {
+                        // Si no se puede parsear, ignorar subredes cercanas
+                    }
+                }
+            }
+            
+            // Agregar broadcasts estándar solo si no están ya incluidos
+            String[] broadcastsEstandar = {
+                "192.168.1.255", "192.168.0.255", "192.168.2.255",
+                "10.0.0.255", "10.0.1.255", "10.1.1.255",
+                "172.16.255.255", "172.31.255.255"
+            };
+            
+            for (String broadcast : broadcastsEstandar) {
+                direccionesBroadcast.add(broadcast);
+            }
+            
             byte[] buffer = MENSAJE_BROADCAST.getBytes();
-            DatagramPacket packet = new DatagramPacket(
-                buffer, buffer.length,
-                InetAddress.getByName("255.255.255.255"), PUERTO_BROADCAST
-            );
             
-            socket.send(packet);
+            // Enviar a todas las direcciones broadcast
+            for (String broadcast : direccionesBroadcast) {
+                try {
+                    System.out.println("[BROADCAST] Enviando a: " + broadcast);
+                    DatagramPacket packet = new DatagramPacket(
+                        buffer, buffer.length,
+                        InetAddress.getByName(broadcast), PUERTO_BROADCAST
+                    );
+                    socket.send(packet);
+                } catch (Exception e) {
+                    System.out.println("   [ERROR] Error enviando a " + broadcast + ": " + e.getMessage());
+                }
+            }
             
+            System.out.println("[LISTEN] Escuchando respuestas...");
             long inicio = System.currentTimeMillis();
+            int respuestasRecibidas = 0;
+            
             while (System.currentTimeMillis() - inicio < TIMEOUT_BUSQUEDA) {
                 try {
                     byte[] respuestaBuffer = new byte[256];
                     DatagramPacket respuesta = new DatagramPacket(respuestaBuffer, respuestaBuffer.length);
                     socket.receive(respuesta);
                     String mensaje = new String(respuesta.getData(), 0, respuesta.getLength());
+                    respuestasRecibidas++;
+                    
+                    System.out.println("[RESPONSE] Respuesta #" + respuestasRecibidas + " de " + 
+                                     respuesta.getAddress().getHostAddress() + ": " + mensaje);
+                    
                     if (mensaje.startsWith(MENSAJE_BROADCAST)) {
                         String[] partes = mensaje.split(":");
                         if (partes.length > 1) {
-                            jugadores.add(partes[1]);
+                            String ipJugador = partes[1];
+                            jugadores.add(ipJugador);
+                            System.out.println("[FOUND] Jugador encontrado: " + ipJugador);
                         }
                     }
                 } catch (SocketTimeoutException e) {
                     break;
                 }
             }
-            socket.close();
+            
+            System.out.println("[COMPLETE] Busqueda completada. Jugadores encontrados: " + jugadores.size());
+            for (String jugador : jugadores) {
+                System.out.println("   - " + jugador);
+            }
+            
         } catch (Exception e) {
-            System.out.println("Error buscando jugadores: " + e.getMessage());
+            System.out.println("[ERROR] Error buscando jugadores: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
         }
         return jugadores;
     }
@@ -334,13 +509,69 @@ public class BlackJack {
         System.out.println("\n=== Modo Multiplayer ===");
         System.out.println("1. Crear partida (esperar jugador)");
         System.out.println("2. Buscar partidas");
-        System.out.print("Opción: ");
+        System.out.println("3. Diagnostico de red");
+        System.out.print("Opcion: ");
         String opcion = in.nextLine().trim();
         
         if (opcion.equals("1")) {
             crearPartida();
         } else if (opcion.equals("2")) {
             buscarYConectar(in);
+        } else if (opcion.equals("3")) {
+            diagnosticoRed();
+        }
+    }
+    
+    static void diagnosticoRed() {
+        System.out.println("\n=== DIAGNOSTICO DE RED ===");
+        try {
+            NetworkDiscovery discovery = new NetworkDiscovery();
+            System.out.println("[INFO] IP local detectada: " + discovery.miIP);
+            
+            // Probar puertos
+            System.out.println("\n[TEST] Probando puertos...");
+            if (probarPuerto(PUERTO_BROADCAST)) {
+                System.out.println("[OK] Puerto " + PUERTO_BROADCAST + " (broadcast) disponible");
+            } else {
+                System.out.println("[ERROR] Puerto " + PUERTO_BROADCAST + " ocupado o bloqueado");
+            }
+            
+            if (probarPuerto(PUERTO_JUEGO)) {
+                System.out.println("[OK] Puerto " + PUERTO_JUEGO + " (juego) disponible");
+            } else {
+                System.out.println("[ERROR] Puerto " + PUERTO_JUEGO + " ocupado o bloqueado");
+            }
+            
+            // Probar broadcast local
+            System.out.println("\n[TEST] Probando broadcast local...");
+            String[] partes = discovery.miIP.split("\\.");
+            if (partes.length == 4) {
+                String broadcastLocal = partes[0] + "." + partes[1] + "." + partes[2] + ".255";
+                System.out.println("[INFO] Direccion broadcast calculada: " + broadcastLocal);
+                
+                try {
+                    InetAddress.getByName(broadcastLocal);
+                    System.out.println("[OK] Direccion broadcast es valida");
+                } catch (Exception e) {
+                    System.out.println("[ERROR] Direccion broadcast invalida: " + e.getMessage());
+                }
+            }
+            
+        } catch (Exception e) {
+            System.out.println("[ERROR] Error en diagnostico: " + e.getMessage());
+        }
+        
+        System.out.println("\n[INFO] Presiona Enter para continuar...");
+        new Scanner(System.in).nextLine();
+    }
+    
+    static boolean probarPuerto(int puerto) {
+        try {
+            DatagramSocket socket = new DatagramSocket(puerto);
+            socket.close();
+            return true;
+        } catch (Exception e) {
+            return false;
         }
     }
     
@@ -351,125 +582,241 @@ public class BlackJack {
             discovery = new NetworkDiscovery();
             discovery.start();
             
-            System.out.println("\nEsperando jugador...");
+            System.out.println("\n=== CREANDO PARTIDA ===");
+            System.out.println("Esperando jugador...");
+            System.out.println("Presiona Ctrl+C para cancelar");
             ServerSocket servidor = new ServerSocket(PUERTO_JUEGO);
             servidor.setSoTimeout(TIMEOUT_SERVIDOR);
             
             Socket cliente = servidor.accept();
-            System.out.println("¡Jugador conectado desde " + cliente.getInetAddress().getHostAddress() + "!");
+            System.out.println("\n¡JUGADOR CONECTADO desde " + cliente.getInetAddress().getHostAddress() + "!");
+            System.out.println("¡INICIANDO JUEGO!");
             
-            // Detener descubrimiento una vez conectado
-            if (discovery != null) discovery.detener();
+            // Detener descubrimiento silenciosamente una vez conectado
+            if (discovery != null) {
+                discovery.running = false;
+                discovery.interrupt();
+            }
             
             jugarMultiplayer(servidor, cliente, true);
         } catch (Exception e) {
             System.out.println("Error al crear partida: " + e.getMessage());
         } finally {
-            if (discovery != null) discovery.detener();
+            // Detener descubrimiento silenciosamente
+            if (discovery != null) {
+                discovery.running = false;
+                discovery.interrupt();
+            }
         }
     }
     
     static void buscarYConectar(Scanner in) {
         while (true) {
-            System.out.println("\nBuscando partidas...");
-            Set<String> jugadores = buscarJugadores();
+            System.out.println("\n=== BUSCAR PARTIDAS ===");
+            System.out.println("1. Busqueda automatica");
+            System.out.println("2. Conexion manual por IP");
+            System.out.println("3. Volver al menu");
+            System.out.print("Selecciona una opcion: ");
+            String opcion = in.nextLine().trim();
             
-            if (jugadores.isEmpty()) {
-                System.out.println("No se encontraron partidas.");
-            } else {
-                System.out.println("\nPartidas disponibles:");
-                List<String> listaJugadores = new ArrayList<>(jugadores);
-                for (int i = 0; i < listaJugadores.size(); i++) {
-                    System.out.println((i + 1) + ". " + listaJugadores.get(i));
-                }
-                System.out.println("\n0. Refrescar");
-                System.out.println("q. Volver al menú");
-                System.out.print("Selecciona una opción: ");
-                String seleccion = in.nextLine().trim();
+            if (opcion.equals("1")) {
+                // Búsqueda automática
+                System.out.println("\nBuscando partidas automaticamente...");
+                Set<String> jugadores = buscarJugadores();
                 
-                if (seleccion.equals("q")) {
-                    return;
-                } else if (seleccion.equals("0")) {
-                    continue;
+                if (jugadores.isEmpty()) {
+                    System.out.println("No se encontraron partidas automaticamente.");
+                    System.out.print("Presiona Enter para volver al menu de busqueda...");
+                    in.nextLine();
                 } else {
-                    try {
-                        int index = Integer.parseInt(seleccion) - 1;
-                        if (index >= 0 && index < listaJugadores.size()) {
-                            String ip = listaJugadores.get(index);
-                            conectarAPartida(ip);
-                            return;
+                    System.out.println("\nPartidas encontradas:");
+                    List<String> listaJugadores = new ArrayList<>(jugadores);
+                    for (int i = 0; i < listaJugadores.size(); i++) {
+                        System.out.println((i + 1) + ". " + listaJugadores.get(i));
+                    }
+                    System.out.println("\n0. Volver al menu de busqueda");
+                    System.out.print("Selecciona una partida: ");
+                    String seleccion = in.nextLine().trim();
+                    
+                    if (seleccion.equals("0")) {
+                        continue;
+                    } else {
+                        try {
+                            int index = Integer.parseInt(seleccion) - 1;
+                            if (index >= 0 && index < listaJugadores.size()) {
+                                String ip = listaJugadores.get(index);
+                                conectarAPartida(ip);
+                                return;
+                            } else {
+                                System.out.println("Opcion no valida.");
+                            }
+                        } catch (NumberFormatException e) {
+                            System.out.println("Opcion no valida.");
                         }
-                    } catch (NumberFormatException e) {
-                        System.out.println("Opción no válida.");
                     }
                 }
+            } else if (opcion.equals("2")) {
+                // Conexión manual
+                System.out.print("Introduce la IP del otro jugador: ");
+                String ipManual = in.nextLine().trim();
+                if (!ipManual.isEmpty()) {
+                    conectarAPartida(ipManual);
+                    return;
+                } else {
+                    System.out.println("IP no valida.");
+                }
+            } else if (opcion.equals("3")) {
+                // Salir
+                return;
+            } else {
+                System.out.println("Opcion no valida.");
             }
-            
-            System.out.print("\nPresiona Enter para refrescar (o 'q' para salir): ");
-            String cmd = in.nextLine().trim();
-            if (cmd.equals("q")) return;
         }
     }
     
     static void conectarAPartida(String ip) {
         try {
-            System.out.println("Conectando a " + ip + "...");
+            System.out.println("[CONNECT] Probando conectividad a " + ip + "...");
+            
+            // Primero probar si el puerto está abierto
+            if (!probarConectividad(ip, PUERTO_JUEGO)) {
+                System.out.println("[ERROR] No se puede conectar a " + ip + ":" + PUERTO_JUEGO);
+                System.out.println("         Asegurate de que:");
+                System.out.println("         1. El otro jugador haya creado una partida");
+                System.out.println("         2. El firewall permita conexiones en el puerto " + PUERTO_JUEGO);
+                System.out.println("         3. Ambos esten en la misma red o tengan conectividad directa");
+                return;
+            }
+            
+            System.out.println("[CONNECT] Conectando a " + ip + "...");
             Socket socket = new Socket(ip, PUERTO_JUEGO);
-            System.out.println("¡Conectado!");
+            System.out.println("\n¡CONECTADO EXITOSAMENTE!");
+            System.out.println("¡INICIANDO JUEGO!");
             
             jugarMultiplayer(null, socket, false);
         } catch (Exception e) {
-            System.out.println("Error al conectar: " + e.getMessage());
+            System.out.println("[ERROR] Error al conectar: " + e.getMessage());
+            System.out.println("        Detalles tecnicos: " + e.getClass().getSimpleName());
+        }
+    }
+    
+    static boolean probarConectividad(String ip, int puerto) {
+        try {
+            Socket testSocket = new Socket();
+            testSocket.connect(new InetSocketAddress(ip, puerto), 3000); // 3 segundos timeout
+            testSocket.close();
+            return true;
+        } catch (Exception e) {
+            System.out.println("[DEBUG] Test de conectividad fallo: " + e.getMessage());
+            return false;
         }
     }
     
     static void jugarMultiplayer(ServerSocket servidor, Socket socket, boolean esServidor) {
+        BufferedReader in = null;
+        PrintWriter out = null;
+        Scanner scanner = null;
+        
         try {
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-            Scanner scanner = new Scanner(System.in);
+            // Configurar streams con timeouts y buffering
+            socket.setSoTimeout(30000); // 30 segundos timeout
+            socket.setKeepAlive(true);
+            
+            in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            out = new PrintWriter(socket.getOutputStream(), true);
+            scanner = new Scanner(System.in);
+            
+            System.out.println("\n" + "=".repeat(50));
+            System.out.println("     BLACKJACK MULTIJUGADOR - JUEGO INICIADO");
+            System.out.println("=".repeat(50));
+            if (esServidor) {
+                System.out.println("ROL: SERVIDOR (tu eres el host)");
+            } else {
+                System.out.println("ROL: CLIENTE (te conectaste a una partida)");
+            }
+            System.out.println("=".repeat(50));
             
             boolean continuarJugando = true;
             
             while (continuarJugando) {
-                if (esServidor) {
-                    // El servidor maneja la baraja
-                    Deck deck = new Deck();
-                    deck.shuffle();
-                    
-                    // Crear manos
-                    Hand manoServidor = new Hand();
-                    Hand manoCliente = new Hand();
-                    
-                    // Repartir cartas
-                    manoServidor.add(deck.deal());
-                    manoCliente.add(deck.deal());
-                    manoServidor.add(deck.deal());
-                    manoCliente.add(deck.deal());
-                    
-                    // Enviar cartas al cliente
-                    out.println("CARTAS:" + serializarMano(manoCliente));
-                    
-                    System.out.println("\n=== Nueva Partida ===");
-                    System.out.println("Tu mano: " + manoServidor);
-                    System.out.println("Esperando al oponente...");
-                    
-                    // Turno del cliente - manejar HIT/STAND
-                    boolean clienteBust = false;
-                    int totalCliente = 0;
+                try {
+                    if (esServidor) {
+                        System.out.println("\n¡NUEVA RONDA! Preparando cartas...");
+                        // El servidor maneja la baraja
+                        Deck deck = new Deck();
+                        deck.shuffle();
+                        
+                        // Crear manos
+                        Hand manoServidor = new Hand();
+                        Hand manoCliente = new Hand();
+                        
+                        // Repartir cartas
+                        manoServidor.add(deck.deal());
+                        manoCliente.add(deck.deal());
+                        manoServidor.add(deck.deal());
+                        manoCliente.add(deck.deal());
+                        
+                        System.out.println("\n=== CARTAS REPARTIDAS ===");
+                        System.out.println("Tu mano: " + manoServidor);
+                        System.out.println("Enviando cartas al oponente...");
+                        
+                        // Enviar cartas al cliente
+                        String cartasSerializadas = serializarMano(manoCliente);
+                        out.println("CARTAS:" + cartasSerializadas);
+                        out.flush(); // Asegurar que se envíe
+                        
+                        if (out.checkError()) {
+                            System.out.println("[ERROR] No se pudieron enviar las cartas al cliente");
+                            continuarJugando = false;
+                            break;
+                        }
+                        
+                        System.out.println("Cartas enviadas. Esperando jugada del oponente...");
+                        
+                        // Turno del cliente - manejar HIT/STAND
+                        boolean clienteBust = false;
+                        int totalCliente = 0;
                     
                     while (true) {
-                        String mensajeCliente = in.readLine();
-                        if (mensajeCliente == null || mensajeCliente.equals("QUIT")) {
-                            System.out.println("\nEl oponente abandonó la partida.");
-                            return;
+                        System.out.println("Esperando respuesta del cliente...");
+                        String mensajeCliente = null;
+                        
+                        try {
+                            mensajeCliente = in.readLine();
+                        } catch (SocketTimeoutException e) {
+                            System.out.println("Timeout esperando respuesta del cliente. Reintentando...");
+                            continue;
                         }
+                        
+                        if (mensajeCliente == null) {
+                            System.out.println("\nEl oponente se desconectó.");
+                            continuarJugando = false;
+                            break;
+                        }
+                        
+                        if (mensajeCliente.equals("QUIT")) {
+                            System.out.println("\nEl oponente abandonó la partida.");
+                            continuarJugando = false;
+                            break;
+                        }
+                        
+                        System.out.println("Recibido del cliente: " + mensajeCliente);
                         
                         if (mensajeCliente.equals("HIT")) {
                             // Cliente pide carta
                             Card nuevaCarta = deck.deal();
                             manoCliente.add(nuevaCarta);
-                            out.println("CARTA:" + nuevaCarta.serialize());
+                            String respuesta = "CARTA:" + nuevaCarta.serialize();
+                            out.println(respuesta);
+                            out.flush();
+                            
+                            if (out.checkError()) {
+                                System.out.println("Error enviando carta al cliente");
+                                continuarJugando = false;
+                                break;
+                            }
+                            
+                            System.out.println("Carta enviada: " + nuevaCarta);
                             
                             // Verificar si se pasó
                             if (manoCliente.isBust()) {
@@ -482,6 +829,11 @@ public class BlackJack {
                             totalCliente = manoCliente.bestBlackjackTotal();
                             break;
                         }
+                    }
+                    
+                    // Si se perdió la conexión, salir del juego
+                    if (!continuarJugando) {
+                        break;
                     }
                     
                     // Turno del servidor
@@ -501,7 +853,8 @@ public class BlackJack {
                         if (ans.equals("q")) {
                             out.println("QUIT");
                             System.out.println("Abandonaste la partida.");
-                            return;
+                            continuarJugando = false;
+                            break;
                         } else if (ans.startsWith("h")) {
                             manoServidor.add(deck.deal());
                             System.out.println("Tu mano: " + manoServidor);
@@ -514,7 +867,8 @@ public class BlackJack {
                     String mensajeTotalCliente = in.readLine();
                     if (mensajeTotalCliente == null || mensajeTotalCliente.equals("QUIT")) {
                         System.out.println("\nEl oponente abandonó.");
-                        return;
+                        continuarJugando = false;
+                        break;
                     }
                     
                     // Enviar resultado
@@ -546,18 +900,21 @@ public class BlackJack {
                     
                 } else {
                     // Cliente
-                    System.out.println("\n=== Nueva Partida ===");
+                    System.out.println("\n¡NUEVA RONDA! Recibiendo cartas...");
                     
                     // Recibir cartas
                     String cartasMsg = in.readLine();
                     if (cartasMsg == null || cartasMsg.equals("QUIT")) {
                         System.out.println("\nEl oponente abandonó la partida.");
+                        continuarJugando = false;
                         break;
                     }
                     
                     Hand manoCliente = deserializarMano(cartasMsg.split(":")[1]);
                     
+                    System.out.println("\n=== CARTAS RECIBIDAS ===");
                     System.out.println("Tu mano: " + manoCliente);
+                    System.out.println("¡ES TU TURNO!");
                     
                     // Turno del cliente
                     boolean clienteBust = false;
@@ -573,14 +930,16 @@ public class BlackJack {
                         if (ans.equals("q")) {
                             out.println("QUIT");
                             System.out.println("Abandonaste la partida.");
-                            return;
+                            continuarJugando = false;
+                            break;
                         } else if (ans.startsWith("h")) {
                             // Solicitar carta al servidor
                             out.println("HIT");
                             String respuesta = in.readLine();
                             if (respuesta == null || respuesta.equals("QUIT")) {
                                 System.out.println("\nEl oponente abandonó.");
-                                return;
+                                continuarJugando = false;
+                                break;
                             }
                             if (respuesta.startsWith("CARTA:")) {
                                 Card c = Card.deserialize(respuesta.split(":", 2)[1]);
@@ -591,6 +950,11 @@ public class BlackJack {
                             out.println("STAND");
                             break;
                         }
+                    }
+                    
+                    // Si se perdió la conexión durante el turno, salir del juego
+                    if (!continuarJugando) {
+                        break;
                     }
                     
                     // Enviar resultado
@@ -607,6 +971,7 @@ public class BlackJack {
                     String resultadoServidor = in.readLine();
                     if (resultadoServidor == null || resultadoServidor.equals("QUIT")) {
                         System.out.println("\nEl oponente abandonó.");
+                        continuarJugando = false;
                         break;
                     }
                     
@@ -666,13 +1031,30 @@ public class BlackJack {
                     continuarJugando = false;
                     // NO esperar respuesta del oponente - salir inmediatamente
                 }
+                
+                } catch (Exception e) {
+                    System.out.println("Error en la comunicacion: " + e.getMessage());
+                    continuarJugando = false;
+                }
             }
-            
-            socket.close();
-            if (servidor != null) servidor.close();
             
         } catch (Exception e) {
             System.out.println("Error durante el juego: " + e.getMessage());
+            System.out.println("Tipo de error: " + e.getClass().getSimpleName());
+            if (e.getMessage().contains("aborted") || e.getMessage().contains("reset")) {
+                System.out.println("La conexion se perdio. El otro jugador puede haberse desconectado.");
+            }
+        } finally {
+            // Cerrar recursos
+            try {
+                if (in != null) in.close();
+                if (out != null) out.close();
+                if (scanner != null) scanner.close();
+                if (socket != null && !socket.isClosed()) socket.close();
+                if (servidor != null && !servidor.isClosed()) servidor.close();
+            } catch (Exception e) {
+                System.out.println("Error cerrando conexiones: " + e.getMessage());
+            }
         }
     }
     
